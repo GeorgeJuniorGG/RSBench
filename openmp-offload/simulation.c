@@ -20,59 +20,64 @@ void run_event_based_simulation(Input input, SimulationData data, unsigned long 
 	int offloaded_to_device = 0;
 
 	// Main simulation loop over macroscopic cross section lookups
+	int num_devices = omp_get_num_devices();
+	int chunk = input.lookups/num_devices;
 
-	#pragma omp target teams distribute parallel for\
-	map(to:data.n_poles[:data.length_n_poles])\
-	map(to:data.n_windows[:data.length_n_windows])\
-	map(to:data.poles[:data.length_poles])\
-	map(to:data.windows[:data.length_windows])\
-	map(to:data.pseudo_K0RS[:data.length_pseudo_K0RS])\
-	map(to:data.num_nucs[:data.length_num_nucs])\
-	map(to:data.mats[:data.length_mats])\
-	map(to:data.concs[:data.length_concs])\
-	map(to:data.max_num_nucs)\
-	map(to:data.max_num_poles)\
-	map(to:data.max_num_windows)\
-	map(tofrom:offloaded_to_device)\
-  map(from:verification[:input.lookups])
-	for( int i = 0; i < input.lookups; i++ )
-	{
-		// Set the initial seed value
-		uint64_t seed = STARTING_SEED;	
-
-		// Forward seed to lookup index (we need 2 samples per lookup)
-		seed = fast_forward_LCG(seed, 2*i);
-
-		// Randomly pick an energy and material for the particle
-		double E = LCG_random_double(&seed);
-		int mat  = pick_mat(&seed);
-
-		double macro_xs[4] = {0};
-
-		calculate_macro_xs( macro_xs, mat, E, input, data.num_nucs, data.mats, data.max_num_nucs, data.concs, data.n_windows, data.pseudo_K0RS, data.windows, data.poles, data.max_num_windows, data.max_num_poles );
-
-		// For verification, and to prevent the compiler from optimizing
-		// all work out, we interrogate the returned macro_xs_vector array
-		// to find its maximum value index, then increment the verification
-		// value by that index. In this implementation, we prevent thread
-		// contention by using an OMP reduction on it. For other accelerators,
-		// a different approach might be required (e.g., atomics, reduction
-		// of thread-specific values in large array via CUDA thrust, etc)
-		double max = -DBL_MAX;
-		int max_idx = 0;
-		for(int x = 0; x < 4; x++ )
+	#pragma omp parallel for num_threads(num_devices)
+	for (int K = 0; K < num_devices; K++) {
+		#pragma omp target teams distribute parallel for\
+				map(to:data.n_poles[:data.length_n_poles])\
+				map(to:data.n_windows[:data.length_n_windows])\
+				map(to:data.poles[:data.length_poles])\
+				map(to:data.windows[:data.length_windows])\
+				map(to:data.pseudo_K0RS[:data.length_pseudo_K0RS])\
+				map(to:data.num_nucs[:data.length_num_nucs])\
+				map(to:data.mats[:data.length_mats])\
+				map(to:data.concs[:data.length_concs])\
+				map(to:data.max_num_nucs)\
+				map(to:data.max_num_poles)\
+				map(to:data.max_num_windows)\
+				map(tofrom:offloaded_to_device)\
+				map(from:verification[K * chunk:((K == num_devices-1) ? chunk + input.lookups%num_devices : chunk)]) device(K)
+		for( int i = K * chunk; i < K * chunk + ((K == num_devices-1) ? chunk + input.lookups%num_devices : chunk); i++ )
 		{
-			if( macro_xs[x] > max )
-			{
-				max = macro_xs[x];
-				max_idx = x;
-			}
-		}
-		verification[i] = max_idx+1;
+			// Set the initial seed value
+			uint64_t seed = STARTING_SEED;	
 
-		// Check if we are currently running on the device or not
-		if( i == 0 )
-			offloaded_to_device = !omp_is_initial_device();
+			// Forward seed to lookup index (we need 2 samples per lookup)
+			seed = fast_forward_LCG(seed, 2*i);
+
+			// Randomly pick an energy and material for the particle
+			double E = LCG_random_double(&seed);
+			int mat  = pick_mat(&seed);
+
+			double macro_xs[4] = {0};
+
+			calculate_macro_xs( macro_xs, mat, E, input, data.num_nucs, data.mats, data.max_num_nucs, data.concs, data.n_windows, data.pseudo_K0RS, data.windows, data.poles, data.max_num_windows, data.max_num_poles );
+
+			// For verification, and to prevent the compiler from optimizing
+			// all work out, we interrogate the returned macro_xs_vector array
+			// to find its maximum value index, then increment the verification
+			// value by that index. In this implementation, we prevent thread
+			// contention by using an OMP reduction on it. For other accelerators,
+			// a different approach might be required (e.g., atomics, reduction
+			// of thread-specific values in large array via CUDA thrust, etc)
+			double max = -DBL_MAX;
+			int max_idx = 0;
+			for(int x = 0; x < 4; x++ )
+			{
+				if( macro_xs[x] > max )
+				{
+					max = macro_xs[x];
+					max_idx = x;
+				}
+			}
+			verification[i] = max_idx+1;
+
+			// Check if we are currently running on the device or not
+			if( i == 0 )
+				offloaded_to_device = !omp_is_initial_device();
+		}
 	}
   
   // Reduce validation hash on the host
